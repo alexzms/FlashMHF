@@ -1,102 +1,161 @@
-# FlashFFN: Flash Multi-Head Feed-Forward Network
+# FlashFFN: Multi-Head Decomposition Enables I/O-Aware Feed-Forward Networks
 
-**Official open-source implementation for the paper**: [Flash Multi-Head Feed-Forward Network (arXiv:2512.06989)](https://www.arxiv.org/abs/2512.06989)
+Official implementation of the NeurIPS 2026 paper *FlashFFN: Multi-Head Decomposition Enables I/O-Aware
+Feed-Forward Networks*. An earlier version of the paper is available on arXiv as
+[Flash Multi-Head Feed-Forward Network (arXiv:2512.06989)](https://www.arxiv.org/abs/2512.06989).
 
 ## Overview
 
-FlashFFN introduces a novel **Flash Multi-Head Feed-Forward Network** architecture that addresses the fundamental limitations of naive Multi-Head FFNs through two key innovations:
+A SwiGLU FFN materializes its `[B, L, d_ff]` intermediate tensor in HBM between the two matmuls.
+A FlashAttention-style one-pass fused kernel would keep it on chip, but it has to hold an output
+accumulator of width `d_model` in SRAM, which does not fit on current NVIDIA datacenter GPUs
+(A100/H100/B200) once `d_model >= 2048` with a sequence tile of 128 or more tokens.
 
-1. **Scale-Balanced Parallel Sub-Networks**: Maintains optimal dimension ratios across model scales through dynamically weighted parallel sub-networks
-2. **Memory-Efficient Flash Kernel**: I/O-aware fused kernel that computes outputs online in SRAM, eliminating the memory explosion problem
-
-### Key Features
-
-- 🚀 **Superior Performance**: Consistently outperforms SwiGLU FFN baselines on perplexity and downstream tasks
-- ⚡ **Memory Efficient**: 3-4x reduction in peak GPU memory usage compared to SwiGLU FFN  
-- 🔥 **Fast Inference**: Up to 1.35x speedup on Hopper architecture
-- 📈 **Scalable**: Validated on models from 128M to 1.3B parameters
-- 🛠️ **Production Ready**: Optimized kernels for both Triton and ThunderKittens (CUDA)
-
-## Architecture
-
-FlashFFN draws inspiration from the structural symmetry between self-attention and FFNs:
+FlashFFN splits the FFN into `H_ffn` heads, so each head's accumulator width `d_h = d_model / H_ffn`
+fits in SRAM. To keep the per-head expansion ratio near the SwiGLU optimum of 8/3, every head uses
+`E` dense sub-networks combined by a learned router:
 
 ```
-Attention: softmax(QK^T/√d_k)V
-FFN:       σ(XW₁)W₂
+O = Σ_e R_e · ((SiLU(Q K_eᵀ) ⊙ (Q U_eᵀ)) V_e)
 ```
 
-Our multi-head design partitions computation across parallel sub-networks with learned gating:
+Here `Q` is the per-head, RMS-normalized projection of the input and `R_e` are sigmoid-normalized
+router weights. The block replaces SwiGLU at matched parameter count and FLOPs and runs as a single
+fused kernel that never writes the intermediate to HBM.
 
-```
-O = Σₑ Rₑ * ((SiLU(Q @ Kₑ^T) ⊙ (Q @ Uₑ^T)) @ Vₑ)
-```
+## Results
 
-### Key Innovations
+All numbers are from the paper. Models are trained on The Pile (60B tokens at 128M/370M, 100B tokens
+at 1.3B), and every comparison is at matched parameters and FLOPs.
 
-1. **Parallel FFN Sub-Networks**: Each head uses E sub-networks with balanced dimension dₑ ≈ (8/3)dₕ
-2. **Flash Algorithm**: Blockwise computation avoids materializing large intermediate tensors
-3. **Gating Mechanism**: Sigmoid-normalized routing weights for dynamic expert selection
+**Evaluation perplexity** (lower is better)
 
-## Model Configurations
+| Model | 128M | 370M | 1.3B |
+|---|---|---|---|
+| Baseline (SwiGLU) | 26.74 | 20.70 | 17.17 |
+| MH-FFN (multi-head split only) | 26.31 | 20.74 | – |
+| Dense-MoE (sub-networks only) | 26.82 | 21.37 | – |
+| **FlashFFN** (`d_h = 128`) | **26.00** | **20.37** | **16.33** |
 
-We provide pre-configured models at different scales:
+Average accuracy over six downstream benchmarks (HellaSwag, SIQA, PIQA, OBQA, WinoGrande, RACE)
+rises from 39.92 to 40.48 at 370M and from 41.75 to 43.35 at 1.3B.
 
-| Model Size | Hidden Size | Layers | FFN Heads | Experts/Head | Config File |
-|------------|-------------|--------|-----------|--------------|-------------|
-| 128M | 768 | 10 | 8 | 8 | [configure-1-tinymhffnmoe.json](configs/mhffnmoe/configure-1-tinymhffnmoe.json) |
-| 370M | 1024 | 20 | 8 | 11 | [configure-2-mhffnmoe-TriDao-350M.json](configs/mhffnmoe/configure-2-mhffnmoe-TriDao-350M.json) |
-| 1.3B | 2048 | 20 | 16 | 22 | [configure-3-mhffnmoe-TriDao-1.3B.json](configs/mhffnmoe/configure-3-mhffnmoe-TriDao-1.3B.json) |
+**Efficiency** (one H100 SXM, bf16, 1.3B configurations)
 
-## Performance Results
+- Per-layer peak FFN memory at bs = 8 (MB):
 
-### Language Modeling (370M Scale)
+  | L | Eager SwiGLU | `torch.compile` | FlashFFN |
+  |---|---|---|---|
+  | 4032 | 1240 | 901 | 524 |
+  | 8064 | 2384 | 1706 | 931 |
+  | 16128 | 4666 | 3311 | 1746 |
+  | 32832 | 9398 | 6640 | 3434 |
 
-| Variant | Eval Loss ↓ | Eval PPL ↓ |
-|---------|-------------|------------|
-| Baseline (SwiGLU) | 3.030 | 20.69 |
-| PKV (d_h=128) | 3.334 | 28.07 |
-| MH-FFN (d_h=128) | 3.031 | 20.71 |
-| **FlashFFN (d_h=128)** | **3.014** | **20.36** |
+  That is 2.4–2.7× below eager SwiGLU (Liger matches eager) and 1.7–1.9× below `torch.compile`.
+- Model-level prefill, 20-layer FlashFFN vs. 24-layer SwiGLU at bs = 8: parity at L = 256 and up to
+  1.18× faster at L = 32K. Against a Liger-fused SwiGLU baseline the speedup is 1.02–1.17×.
+- Decode: 1.08–1.19× in the CUDA-graph decode-step estimate (bs = 1 and 8, 4K and 32K context).
 
-### Memory & Speed Improvements
+[`benchmarks/README.md`](benchmarks/README.md) describes exactly what each measurement covers.
 
-- **Memory**: 3-5x reduction in peak GPU memory vs SwiGLU FFN
-- **Speed**: Up to 1.08x inference speedup on H100 GPUs
-- **Scaling**: Consistent improvements from 128M to 1.3B parameters
+## Model configurations
+
+The configs in [`configs/`](configs/) match the paper's configuration table.
+
+| Scale | Model | Config | Layers | `d_model` | `H_ffn` / `d_h` | `E` | Intermediate size |
+|---|---|---|---|---|---|---|---|
+| 128M | FlashFFN | [`configure-1-tinymhffnmoe.json`](configs/mhffnmoe/configure-1-tinymhffnmoe.json) | 10 | 768 | 6 / 128 | 8 | 2048 |
+| 370M | FlashFFN | [`configure-2-mhffnmoe-TriDao-350M.json`](configs/mhffnmoe/configure-2-mhffnmoe-TriDao-350M.json) | 21 | 1024 | 8 / 128 | 7 | 2688 |
+| 1.3B | FlashFFN | [`configure-3-mhffnmoe-TriDao-1.3B.json`](configs/mhffnmoe/configure-3-mhffnmoe-TriDao-1.3B.json) | 20 | 2048 | 16 / 128 | 15 | 5760 |
+| 128M | SwiGLU | [`configure8-tinyllama.json`](configs/baseline/configure8-tinyllama.json) | 12 | 768 | – | – | 2048 |
+| 370M | SwiGLU | [`configure9-TriDao-350M-bf16-pile.json`](configs/baseline/configure9-TriDao-350M-bf16-pile.json) | 24 | 1024 | – | – | 2752 |
+| 1.3B | SwiGLU | [`configure10-TriDao-1.3B-bf16-pile.json`](configs/baseline/configure10-TriDao-1.3B-bf16-pile.json) | 24 | 2048 | – | – | 5504 |
+
+The MH-FFN control configs are in [`configs/mhffn/`](configs/mhffn/).
+
+## Using the model
+
+The model code is a Hugging Face Transformers model (`model_type: "mhffnmoe"`), developed in a
+Transformers 4.52 source tree. To use it:
+
+1. Copy it into a Transformers 4.52 source checkout and install that checkout:
+
+   ```bash
+   cp -r models/flashmhf /path/to/transformers/src/transformers/models/mhffnmoe
+   pip install -e /path/to/transformers
+   ```
+
+2. Point the model at the Triton kernels:
+
+   ```bash
+   export FLASHFFN_TRITON_DIR=/path/to/FlashMHF/kernels/triton
+   ```
+
+3. Build a model from one of the configs:
+
+   ```python
+   from transformers.models.mhffnmoe.configuration_mhffnmoe import MHFFNMoEConfig
+   from transformers.models.mhffnmoe.modeling_mhffnmoe import MHFFNMoEForCausalLM
+
+   config = MHFFNMoEConfig.from_json_file("configs/mhffnmoe/configure-3-mhffnmoe-TriDao-1.3B.json")
+   model = MHFFNMoEForCausalLM(config)
+   ```
+
+   To use it through the `Auto*` classes, register it first with
+   `AutoConfig.register("mhffnmoe", MHFFNMoEConfig)` and
+   `AutoModelForCausalLM.register(MHFFNMoEConfig, MHFFNMoEForCausalLM)`.
+
+With `mhffnmoe_use_flash=True` (the default) the FFN uses the fused Triton kernel. If the kernel cannot
+be imported, the model prints a warning and falls back to the PyTorch implementation.
 
 ## Kernels
 
-FlashFFN includes optimized kernel implementations:
+- [`kernels/triton/`](kernels/triton/):
+  - `flash_mlp_moe.py`: fused multi-head FFN with sub-networks, forward and backward.
+  - `flash_mlp.py`: single sub-network (legacy) variant.
+  - `fused_prologue.py`: fused per-head RMSNorm, router and layout transform for prefill.
+  - `decode_kernel.py`: fused decode-step FFN (norm, router and sub-networks in one launch).
+- [`kernels/thunderkittens/`](kernels/thunderkittens/), for H100 (`sm_90a`):
+  - `flash_ffn_moe.cu`: forward and backward, head-major output.
+  - `flash_ffn_moe_fast.cu`: forward with token-major output. Together with `fused_prologue.py`, this is
+    the path used for the efficiency results in the paper.
 
-### Triton Kernels
-- **Location**: `kernels/triton/`
-- **Features**: Auto-tuned block sizes, memory-coalesced access patterns
-- **Usage**: Default backend, works on most CUDA GPUs
+  Build both with:
 
-### ThunderKittens CUDA Kernels  
-- **Location**: `kernels/thunderkittens/`
-- **Features**: Highly optimized for H100, warp-level programming
-- **Requirements**: CUDA 12.0+, H100 GPU recommended
+  ```bash
+  export THUNDERKITTENS_ROOT=/path/to/ThunderKittens   # the paper used commit 6c27e28
+  make -C kernels/thunderkittens
+  ```
 
-## Repository Structure
+## Repository structure
 
 ```
-FlashFFN/
-├── models/FlashFFN/              # Model implementations
-│   ├── modeling_mhffnmoe.py      # Main model class
-│   ├── configuration_mhffnmoe.py # Model configuration
-│   └── convert_mhffnmoe_weights_to_hf.py
-├── kernels/                      # Optimized kernel implementations  
-│   ├── triton/                   # Triton-based kernels
-│   │   ├── flash_mlp.py          # Single-head flash MLP
-│   │   └── flash_mlp_moe.py      # Multi-expert flash MLP
-│   └── thunderkittens/           # CUDA-based kernels
-│       ├── flash_ffn_moe.cu      # CUDA kernel implementation
-│       ├── flash_ffn_moe_torch.py # PyTorch wrapper
-│       └── run_from_python.py    # Test script
-├── configs/                      # Model configurations
-│   ├── baseline/                 # SwiGLU baseline configs
-│   ├── mhffn/                    # Naive multi-head FFN configs  
-└── └── mhffnmoe/                 # FlashFFN configs
+FlashMHF/
+├── models/flashmhf/      # Transformers model code (model_type "mhffnmoe")
+├── kernels/
+│   ├── triton/           # Triton kernels
+│   └── thunderkittens/   # ThunderKittens (CUDA) kernels for H100
+├── configs/
+│   ├── baseline/         # SwiGLU baselines
+│   ├── mhffn/            # MH-FFN control
+│   └── mhffnmoe/         # FlashFFN
+└── benchmarks/           # efficiency benchmarks (see benchmarks/README.md)
 ```
+
+## Citation
+
+```bibtex
+@inproceedings{zhang2026flashffn,
+  title     = {{FlashFFN}: Multi-Head Decomposition Enables {I/O}-Aware Feed-Forward Networks},
+  author    = {Zhang, Minshen and Hu, Xiang and Li, Jianguo and Wu, Wei and Tu, Kewei},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2026}
+}
+```
+
+## License
+
+This project is released under the [Apache License 2.0](LICENSE). The model code in `models/flashmhf/`
+is derived from Hugging Face Transformers (Apache-2.0). The kernels are written with
+[ThunderKittens](https://github.com/HazyResearch/ThunderKittens) and [Triton](https://github.com/triton-lang/triton),
+both MIT-licensed.
