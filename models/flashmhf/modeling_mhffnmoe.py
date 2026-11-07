@@ -317,13 +317,25 @@ class MHFFNMoEMultiHeadFFNFlash(nn.Module):
                     try:
                         import sys
                         import os
+                        # The Triton kernels live in kernels/triton/ of this repository. Point
+                        # FLASHFFN_TRITON_DIR at that directory (or add it to PYTHONPATH). The
+                        # relative path and the ops.* imports keep the original development layout working.
+                        _triton_dir = os.environ.get("FLASHFFN_TRITON_DIR")
+                        if _triton_dir and _triton_dir not in sys.path:
+                            sys.path.insert(0, _triton_dir)
                         sys.path.append(os.path.join(os.path.dirname(__file__), '../../../../..'))
                         if self.config.mhffnmoe_use_legacy_flash:
-                            from ops.flash_mlp import FlashMLP
+                            try:
+                                from flash_mlp import FlashMLP
+                            except ImportError:
+                                from ops.flash_mlp import FlashMLP
                             self.flash_mlp = FlashMLP()
                             print("Using Flash MLP Legacy(moe) Triton implementation")
                         else:
-                            from ops.flash_mlp_moe import FlashMLPMoE
+                            try:
+                                from flash_mlp_moe import FlashMLPMoE
+                            except ImportError:
+                                from ops.flash_mlp_moe import FlashMLPMoE
                             self.flash_mlp = FlashMLPMoE()
                             print("Using Flash MLP MoE Triton implementation")
                         self.use_cuda_flash_mlp = False
