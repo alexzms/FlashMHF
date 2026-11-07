@@ -4,6 +4,9 @@ GPU=Hopper
 
 TARGET=flash_ffn_moe
 SRC=flash_ffn_moe.cu
+# Token-major output variant (module flash_ffn_moe_fast), used for the paper's efficiency results
+FAST_TARGET=flash_ffn_moe_fast
+FAST_SRC=flash_ffn_moe_fast.cu
 
 TORCH_INC      := $(shell python3 -c "import torch, os; base=os.path.dirname(torch.__file__); print(base + '/include')")
 TORCH_INC_API  := $(shell python3 -c "import torch, os; base=os.path.dirname(torch.__file__); print(base + '/include/torch/csrc/api/include')")
@@ -31,11 +34,14 @@ NVCCFLAGS += -DKITTENS_A100 -arch=sm_80
 endif
 
 # Default target
-all: $(TARGET)
+all: $(TARGET) $(FAST_TARGET)
 
 $(TARGET): $(SRC)
 	$(NVCC) $(SRC) $(NVCCFLAGS) -o $(TARGET)$(shell python3-config --extension-suffix)
 
+$(FAST_TARGET): $(FAST_SRC)
+	$(NVCC) $(FAST_SRC) $(NVCCFLAGS) -o $(FAST_TARGET)$(shell python3-config --extension-suffix)
+
 # Clean target
 clean:
-	rm -f $(TARGET) 
+	rm -f $(TARGET) $(FAST_TARGET) 
